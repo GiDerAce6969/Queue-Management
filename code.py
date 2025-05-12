@@ -1,365 +1,415 @@
 import streamlit as st
 import google.generativeai as genai
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import random
+import numpy as np # For potential poisson distribution of arrivals
 
 # --- Configuration & Initialization ---
-st.set_page_config(layout="wide", page_title="Intelligent Queue System (Gemini)")
+st.set_page_config(layout="wide", page_title="Supermarket Queue Automation")
 
-# Initialize session state variables if they don't exist
-if 'initialized' not in st.session_state:
-    st.session_state.gemini_api_key = "" # Changed from openai_api_key
-    st.session_state.queue = []  # List of dictionaries for queue items
-    st.session_state.agents = [] # List of dictionaries for agents
-    st.session_state.next_agent_id_counter = 1
-    st.session_state.logs = [] # For system logs/events
-    st.session_state.initialized = True
+# Constants
+SIMULATION_STEP_MINUTES = 1 # Each step in simulation represents 1 minute
+MAX_ITEMS_PER_CUSTOMER = 50
+MIN_ITEMS_PER_CUSTOMER = 1
+STAFFED_SERVICE_RATE_ITEMS_PER_MIN = 10 # Items a staffed cashier can process per minute
+SELF_SERVICE_RATE_ITEMS_PER_MIN = 15  # Items a customer can process at self-service per minute (faster per item but might be overall slower due to user)
+CUSTOMER_ARRIVAL_PROBABILITY_PER_STEP = 0.6 # Probability a new customer arrives each minute during peak
+
+# Thresholds for dynamic counter management
+OPEN_COUNTER_AVG_WAIT_THRESHOLD_MIN = 5  # If avg wait time > 5 mins, consider opening a counter
+CLOSE_COUNTER_AVG_WAIT_THRESHOLD_MIN = 1 # If avg wait time < 1 min and counters idle, consider closing
+OPEN_COUNTER_QUEUE_LENGTH_THRESHOLD = 3 # If avg customers per open counter > 3, consider opening
+
+if 'sim_initialized' not in st.session_state:
+    st.session_state.gemini_api_key_supermarket = ""
+    st.session_state.counters = []
+    st.session_state.customers_served_today = [] # To track wait times
+    st.session_state.total_customers_in_system = 0
+    st.session_state.system_log_supermarket = []
+    st.session_state.simulation_time = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0) # Start at 9 AM
+    st.session_state.simulation_running = False
+    st.session_state.initial_counters_defined = False
+    st.session_state.sim_initialized = True
+
 
 # --- Helper Functions ---
+def log_event_supermarket(event_message):
+    timestamp = st.session_state.simulation_time.strftime("%H:%M")
+    log_entry = f"[{timestamp}] {event_message}"
+    st.session_state.system_log_supermarket.append(log_entry)
+    if len(st.session_state.system_log_supermarket) > 30:
+        st.session_state.system_log_supermarket.pop(0)
 
-def log_event(event_message):
-    """Adds an event to the system log."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.logs.append(f"[{timestamp}] {event_message}")
-    if len(st.session_state.logs) > 20: # Keep logs to a reasonable size
-        st.session_state.logs.pop(0)
-
-def get_gemini_response(prompt_text, temperature=0.7, max_tokens=250): # Renamed and updated
-    """Generates a response from Google's Gemini model."""
-    if not st.session_state.gemini_api_key:
+def get_gemini_supermarket_response(prompt_text, temperature=0.7, max_tokens=200):
+    if not st.session_state.gemini_api_key_supermarket:
         st.error("Google AI API Key not set. Please set it in the sidebar.")
         return None
     try:
-        genai.configure(api_key=st.session_state.gemini_api_key)
-        
+        genai.configure(api_key=st.session_state.gemini_api_key_supermarket)
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         generation_config = genai.types.GenerationConfig(
             temperature=temperature,
             max_output_tokens=max_tokens
         )
-        
-        # For Gemini, we can define a system-like instruction within the prompt itself
-        # or use multi-turn chat if needed for more complex context.
-        # For simple requests, a direct prompt is often sufficient.
-        # You might prepend a general instruction like:
-        # "You are a helpful assistant for a customer support queue. "
-        # However, for specific tasks like summarization or response suggestion,
-        # the prompt_text itself will carry the main instruction.
-
-        model = genai.GenerativeModel('gemini-1.5-flash-latest') # Using Gemini 1.5 Flash
-        
-        full_prompt = f"As a helpful assistant for a customer support queue: {prompt_text}"
-
+        # Prepend a role for better context (optional, but can help)
+        full_prompt = f"You are an AI assistant analyzing a supermarket queue simulation. {prompt_text}"
         response = model.generate_content(full_prompt, generation_config=generation_config)
-        
-        # Handle potential blocks or empty responses
+
         if response.parts:
             return response.text
         else:
-            # This can happen if the response was blocked due to safety settings
-            # or if no content was generated.
             block_reason = response.prompt_feedback.block_reason if response.prompt_feedback else "Unknown"
-            st.warning(f"Gemini AI: No content generated or response blocked. Reason: {block_reason}")
-            log_event(f"Gemini AI: No content or blocked. Reason: {block_reason} for prompt: {prompt_text[:50]}...")
+            st.warning(f"Gemini AI: No content or blocked. Reason: {block_reason}")
+            log_event_supermarket(f"Gemini AI: No content or blocked. Reason: {block_reason}")
             return None
-
     except Exception as e:
         st.error(f"Gemini API Error: {e}")
-        log_event(f"Gemini API Error: {e}")
+        log_event_supermarket(f"Gemini API Error: {e}")
         return None
 
-def add_to_queue(user_name, issue_description, priority="Medium"):
-    """Adds a new item to the support queue."""
-    item_id = str(uuid.uuid4())
-    new_item = {
-        "id": item_id,
-        "user_name": user_name,
-        "issue_description": issue_description,
-        "priority": priority, # "Low", "Medium", "High"
-        "timestamp": datetime.now(),
-        "status": "Pending", # Pending, Assigned, In Progress, Resolved
-        "assigned_agent_id": None,
-        "resolution_notes": "",
-        "suggested_priority_reason": "" # For agentic AI
-    }
-    # Agentic AI: Basic Priority Suggestion based on keywords
-    if "urgent" in issue_description.lower() or "critical" in issue_description.lower():
-        new_item["priority"] = "High"
-        new_item["suggested_priority_reason"] = "Keyword 'urgent' or 'critical' detected."
-    elif "asap" in issue_description.lower():
-        new_item["priority"] = "High"
-        new_item["suggested_priority_reason"] = "Keyword 'ASAP' detected."
+def initialize_counters(num_staffed, num_self_service):
+    st.session_state.counters = []
+    counter_id = 1
+    for _ in range(num_staffed):
+        st.session_state.counters.append({
+            "id": f"S{counter_id}", "type": "Staffed", "status": "Closed", # Start staffed counters closed
+            "queue": [], "service_rate": STAFFED_SERVICE_RATE_ITEMS_PER_MIN,
+            "current_customer": None, "items_remaining_on_customer": 0,
+            "time_busy_current_step": 0
+        })
+        counter_id += 1
+    for _ in range(num_self_service):
+        st.session_state.counters.append({
+            "id": f"K{counter_id}", "type": "Self-Service", "status": "Open", # Self-service always open
+            "queue": [], "service_rate": SELF_SERVICE_RATE_ITEMS_PER_MIN,
+            "current_customer": None, "items_remaining_on_customer": 0,
+            "time_busy_current_step": 0
+        })
+        counter_id += 1
+    st.session_state.initial_counters_defined = True
+    log_event_supermarket(f"Initialized {num_staffed} staffed and {num_self_service} self-service counters.")
 
-    st.session_state.queue.append(new_item)
-    log_event(f"New item added to queue: ID {item_id[:8]} by {user_name}, Priority: {new_item['priority']}")
-    return item_id
+def calculate_estimated_wait_time(counter, new_customer_items=0):
+    """Calculates estimated time for new customer if they join this counter's queue."""
+    wait_time_seconds = 0
+    # Time for customers already in queue
+    for cust_in_queue in counter["queue"]:
+        wait_time_seconds += (cust_in_queue["items"] / counter["service_rate"]) * 60
+    # Time for current customer being served
+    if counter["current_customer"]:
+        wait_time_seconds += (counter["items_remaining_on_customer"] / counter["service_rate"]) * 60
+    # Time for the new customer
+    if new_customer_items > 0:
+         wait_time_seconds += (new_customer_items / counter["service_rate"]) * 60
+    return wait_time_seconds / 60 # in minutes
 
-def add_agent(agent_name):
-    """Adds a new agent to the system."""
-    agent_id = f"agent_{st.session_state.next_agent_id_counter}"
-    st.session_state.next_agent_id_counter += 1
-    new_agent = {
-        "id": agent_id,
-        "name": agent_name,
-        "available": True,
-        "current_task_id": None,
-        "tasks_resolved": 0,
-        "specialization": random.choice(["General", "Technical", "Billing", "Product"])
-    }
-    st.session_state.agents.append(new_agent)
-    log_event(f"New agent added: {agent_name} (ID: {agent_id})")
-    return agent_id
+def assign_customer_to_optimal_counter(customer):
+    """Agentic AI: Assigns customer to the best available open counter."""
+    best_counter = None
+    min_wait_time = float('inf')
 
-def assign_task_to_agent(task_id, agent_id):
-    """Assigns a task to an agent."""
-    task = next((t for t in st.session_state.queue if t["id"] == task_id), None)
-    agent = next((a for a in st.session_state.agents if a["id"] == agent_id), None)
+    open_counters = [c for c in st.session_state.counters if c["status"] == "Open"]
+    if not open_counters:
+        log_event_supermarket(f"No open counters! Customer {customer['id'][:4]} has to wait globally.")
+        # In a more complex system, this customer would go to a "waiting area"
+        # For simplicity, we'll assume this scenario implies a need to open a counter.
+        return False # Indicate assignment failed
 
-    if task and agent and agent["available"] and task["status"] == "Pending":
-        task["status"] = "Assigned"
-        task["assigned_agent_id"] = agent_id
-        agent["available"] = False
-        agent["current_task_id"] = task_id
-        log_event(f"Task {task_id[:8]} assigned to agent {agent['name']}.")
+    for counter in open_counters:
+        est_wait = calculate_estimated_wait_time(counter, customer["items"])
+        # Prefer self-service for small baskets if available and wait times are comparable
+        if customer["items"] <= 10 and counter["type"] == "Self-Service" and est_wait < min_wait_time + 0.5: # Add slight preference
+            min_wait_time = est_wait
+            best_counter = counter
+        elif est_wait < min_wait_time:
+            min_wait_time = est_wait
+            best_counter = counter
+
+    if best_counter:
+        best_counter["queue"].append(customer)
+        log_event_supermarket(f"Customer {customer['id'][:4]} ({customer['items']} items) assigned to {best_counter['type']} Counter {best_counter['id']}. Est. wait: {min_wait_time:.1f} min.")
         return True
-    log_event(f"Failed to assign task {task_id[:8]} to agent {agent_id if agent else 'N/A'}.")
-    return False
+    else: # Should not happen if open_counters is not empty, but as a fallback
+        log_event_supermarket(f"Could not find an optimal counter for Customer {customer['id'][:4]}.")
+        return False
 
-def resolve_task(task_id, resolution_notes):
-    """Marks a task as resolved."""
-    task = next((t for t in st.session_state.queue if t["id"] == task_id), None)
-    if task and task["assigned_agent_id"]:
-        agent = next((a for a in st.session_state.agents if a["id"] == task["assigned_agent_id"]), None)
-        task["status"] = "Resolved"
-        task["resolution_notes"] = resolution_notes
-        if agent:
-            agent["available"] = True
-            agent["current_task_id"] = None
-            agent["tasks_resolved"] += 1
-        log_event(f"Task {task_id[:8]} resolved by agent {agent['name'] if agent else 'Unknown'}.")
-        return True
-    log_event(f"Failed to resolve task {task_id[:8]}. Task not found or not assigned.")
-    return False
 
-def get_suggested_next_task(agent_id=None):
-    """Agentic AI: Suggests the next task to pick based on priority and age."""
-    pending_tasks = [t for t in st.session_state.queue if t["status"] == "Pending"]
-    if not pending_tasks:
-        return None
-
-    priority_map = {"High": 0, "Medium": 1, "Low": 2}
-    pending_tasks.sort(key=lambda t: (priority_map.get(t["priority"], 3), t["timestamp"]))
+def manage_counter_availability_agent():
+    """Agentic AI: Opens/Closes staffed counters based on demand."""
+    open_staffed_counters = [c for c in st.session_state.counters if c["type"] == "Staffed" and c["status"] == "Open"]
+    closed_staffed_counters = [c for c in st.session_state.counters if c["type"] == "Staffed" and c["status"] == "Closed"]
     
-    return pending_tasks[0]
+    all_open_counters = [c for c in st.session_state.counters if c["status"] == "Open"]
+    if not all_open_counters: # Ensure at least one self-service or ability to open a staffed one
+        if closed_staffed_counters:
+            counter_to_open = closed_staffed_counters[0]
+            counter_to_open["status"] = "Open"
+            log_event_supermarket(f"AGENT DECISION: No counters open! Opening Staffed Counter {counter_to_open['id']}.")
+            return "Opened a counter as none were active."
+        return "No counters to manage."
+
+
+    total_customers_waiting = sum(len(c["queue"]) for c in all_open_counters) + sum(1 for c in all_open_counters if c["current_customer"])
+    avg_customers_per_open_counter = total_customers_waiting / len(all_open_counters) if all_open_counters else 0
+    
+    # Calculate current average wait time (simplified: for customers at head of queue)
+    current_wait_times = []
+    for c in all_open_counters:
+        if c["queue"]: # consider only those with queues for this metric
+             # time for current customer + first in queue
+            base_wait = (c["items_remaining_on_customer"] / c["service_rate"]) * 60 if c["current_customer"] else 0
+            current_wait_times.append((base_wait + (c["queue"][0]["items"] / c["service_rate"]) * 60) / 60)
+
+    avg_wait_time_system = np.mean(current_wait_times) if current_wait_times else 0
+
+    decision_reason = ""
+
+    # Rule to OPEN a staffed counter
+    if closed_staffed_counters:
+        if avg_wait_time_system > OPEN_COUNTER_AVG_WAIT_THRESHOLD_MIN or avg_customers_per_open_counter > OPEN_COUNTER_QUEUE_LENGTH_THRESHOLD :
+            counter_to_open = closed_staffed_counters[0] # Open the first available closed one
+            counter_to_open["status"] = "Open"
+            decision_reason = f"Avg wait time {avg_wait_time_system:.1f} min (>{OPEN_COUNTER_AVG_WAIT_THRESHOLD_MIN}) and/or avg queue {avg_customers_per_open_counter:.1f} (>{OPEN_COUNTER_QUEUE_LENGTH_THRESHOLD}). Opening Staffed Counter {counter_to_open['id']}."
+            log_event_supermarket(f"AGENT DECISION: {decision_reason}")
+            return decision_reason
+
+    # Rule to CLOSE a staffed counter (if more than one is open)
+    if len(open_staffed_counters) > 1: # Keep at least one staffed counter open if it's the only type or as a policy
+        if avg_wait_time_system < CLOSE_COUNTER_AVG_WAIT_THRESHOLD_MIN and avg_customers_per_open_counter < (OPEN_COUNTER_QUEUE_LENGTH_THRESHOLD / 2):
+            # Find an idle staffed counter to close
+            for counter in open_staffed_counters:
+                if not counter["current_customer"] and not counter["queue"]:
+                    counter["status"] = "Closed"
+                    decision_reason = f"Low demand: Avg wait time {avg_wait_time_system:.1f} min (<{CLOSE_COUNTER_AVG_WAIT_THRESHOLD_MIN}) & avg queue {avg_customers_per_open_counter:.1f}. Closing Staffed Counter {counter['id']}."
+                    log_event_supermarket(f"AGENT DECISION: {decision_reason}")
+                    return decision_reason
+    return "No change in counter status needed based on current load."
+
+
+def process_counters_step():
+    """Simulates one time step of processing at all counters."""
+    for counter in st.session_state.counters:
+        if counter["status"] != "Open":
+            counter["time_busy_current_step"] = 0
+            continue
+
+        counter["time_busy_current_step"] = 0 # Reset for this step
+        if counter["current_customer"]:
+            items_processed_this_step = counter["service_rate"] * (SIMULATION_STEP_MINUTES)
+            counter["items_remaining_on_customer"] -= items_processed_this_step
+            counter["time_busy_current_step"] = SIMULATION_STEP_MINUTES # Assume busy for the whole step if processing
+
+            if counter["items_remaining_on_customer"] <= 0:
+                served_customer = counter["current_customer"]
+                wait_time = (st.session_state.simulation_time - served_customer["arrival_time"]).total_seconds() / 60
+                st.session_state.customers_served_today.append({"id": served_customer["id"], "wait_time_min": wait_time, "items": served_customer["items"]})
+                log_event_supermarket(f"Customer {served_customer['id'][:4]} ({served_customer['items']} items) served at Counter {counter['id']}. Wait: {wait_time:.1f} min.")
+                counter["current_customer"] = None
+                counter["items_remaining_on_customer"] = 0
+                st.session_state.total_customers_in_system -=1
+
+
+        # If counter is idle and has a queue, pick next customer
+        if not counter["current_customer"] and counter["queue"]:
+            next_customer = counter["queue"].pop(0)
+            counter["current_customer"] = next_customer
+            counter["items_remaining_on_customer"] = next_customer["items"]
+            # time_busy_current_step will be counted in the next step when items are processed
+            log_event_supermarket(f"Counter {counter['id']} started serving Customer {next_customer['id'][:4]} ({next_customer['items']} items).")
+
+
+def simulate_one_step():
+    st.session_state.simulation_time += timedelta(minutes=SIMULATION_STEP_MINUTES)
+    log_event_supermarket(f"--- Simulation Step: Time is now {st.session_state.simulation_time.strftime('%H:%M')} ---")
+
+    # 1. Manage counter availability (Agentic AI)
+    decision_log = manage_counter_availability_agent()
+    if decision_log and "No change" not in decision_log and "No counters to manage" not in decision_log:
+        st.session_state.last_counter_management_decision = decision_log
+
+
+    # 2. New customer arrivals
+    # More customers during peak hours (e.g. 12-2 PM, 5-7 PM)
+    current_hour = st.session_state.simulation_time.hour
+    arrival_prob = CUSTOMER_ARRIVAL_PROBABILITY_PER_STEP
+    if 12 <= current_hour < 14 or 17 <= current_hour < 19:
+        arrival_prob *= 1.5 # Higher arrival rate during peak
+    if random.random() < arrival_prob:
+        num_items = random.randint(MIN_ITEMS_PER_CUSTOMER, MAX_ITEMS_PER_CUSTOMER)
+        customer_id = str(uuid.uuid4())
+        new_customer = {"id": customer_id, "items": num_items, "arrival_time": st.session_state.simulation_time}
+        st.session_state.total_customers_in_system +=1
+        log_event_supermarket(f"New customer {customer_id[:4]} arrived with {num_items} items.")
+        assign_customer_to_optimal_counter(new_customer)
+
+    # 3. Process items at each counter
+    process_counters_step()
+
+    # 4. Update overall metrics (could be done less frequently for performance)
+    # (Metrics like avg wait time are better calculated when customers complete service)
 
 
 # --- Streamlit UI ---
 
-# --- Sidebar ---
+# Sidebar for controls
 with st.sidebar:
-    st.header("⚙️ System Configuration")
-    # Changed to Gemini API Key
-    st.session_state.gemini_api_key = st.text_input(
-        "Google AI Studio API Key", 
-        type="password", 
-        value=st.session_state.gemini_api_key,
-        help="Get your key from Google AI Studio (makersuite.google.com)"
+    st.header("⚙️ System Setup & Controls")
+    st.session_state.gemini_api_key_supermarket = st.text_input(
+        "Google AI Studio API Key",
+        type="password",
+        value=st.session_state.gemini_api_key_supermarket,
+        help="Get your key from Google AI Studio (makersuite.google.com)",
+        key="gemini_api_key_sb"
     )
-    if not st.session_state.gemini_api_key:
-        st.warning("Please enter your Google AI API Key to enable Generative AI features.")
 
-    st.subheader("👤 Add Agent")
-    with st.form("add_agent_form"):
-        new_agent_name = st.text_input("Agent Name")
-        submitted_add_agent = st.form_submit_button("Add Agent")
-        if submitted_add_agent and new_agent_name:
-            add_agent(new_agent_name)
-            st.success(f"Agent {new_agent_name} added.")
-
-    if not st.session_state.agents:
-        if st.button("Add Default Agents (Alice, Bob)"):
-            add_agent("Alice")
-            add_agent("Bob")
-            st.rerun()
-
-    st.subheader("📊 System Stats")
-    st.metric("Total Tasks in Queue", len(st.session_state.queue))
-    st.metric("Pending Tasks", len([t for t in st.session_state.queue if t["status"] == "Pending"]))
-    st.metric("Total Agents", len(st.session_state.agents))
-    st.metric("Available Agents", len([a for a in st.session_state.agents if a["available"]]))
-
-    st.subheader("📜 System Logs")
-    log_container = st.container(height=200)
-    for log in reversed(st.session_state.logs):
-        log_container.caption(log)
-
-# --- Main Application Area ---
-st.title("🚀 Intelligent Queue Management System (Powered by Gemini)")
-st.markdown("Manage customer requests efficiently with AI-powered assistance.")
-
-tab1, tab2, tab3 = st.tabs(["📥 Submit Request", "📊 Queue Dashboard", "🧑‍💻 Agent View"])
-
-# --- Tab 1: Submit Request ---
-with tab1:
-    st.header("➕ Submit a New Request")
-    with st.form("new_request_form", clear_on_submit=True):
-        user_name = st.text_input("Your Name", placeholder="e.g., John Doe")
-        issue_description = st.text_area("Describe your issue", placeholder="e.g., My internet is not working.")
-        priority_options = ["Low", "Medium", "High"]
-        priority = st.selectbox("Priority (can be auto-adjusted by AI)", priority_options, index=1)
-        submitted_request = st.form_submit_button("Submit Request")
-
-        if submitted_request:
-            if user_name and issue_description:
-                item_id = add_to_queue(user_name, issue_description, priority)
-                st.success(f"Request submitted successfully! Your Ticket ID: {item_id[:8]}")
-                time.sleep(0.5)
+    if not st.session_state.initial_counters_defined:
+        st.subheader("Define Counters")
+        num_staffed_init = st.number_input("Number of Staffed Counters", min_value=0, max_value=10, value=3, key="num_staffed_sb")
+        num_self_service_init = st.number_input("Number of Self-Service Kiosks", min_value=0, max_value=10, value=4, key="num_self_sb")
+        if st.button("Initialize Supermarket Layout"):
+            if num_staffed_init + num_self_service_init > 0:
+                initialize_counters(num_staffed_init, num_self_service_init)
+                st.success("Supermarket layout initialized!")
                 st.rerun()
             else:
-                st.error("Please fill in all fields.")
-
-# --- Tab 2: Queue Dashboard ---
-with tab2:
-    st.header("📋 Current Queue")
-    if not st.session_state.queue:
-        st.info("The queue is currently empty.")
+                st.error("Please define at least one counter.")
     else:
-        queue_data = []
-        for item in sorted(st.session_state.queue, key=lambda x: ({"High":0, "Medium":1, "Low":2, "Pending":3, "Assigned":4, "In Progress": 5, "Resolved":6}[x['priority']], x['timestamp'])):
-            agent_name = ""
-            if item["assigned_agent_id"]:
-                agent_name = next((a["name"] for a in st.session_state.agents if a["id"] == item["assigned_agent_id"]), "N/A")
-            
-            priority_display = item['priority']
-            if item['suggested_priority_reason']:
-                priority_display += f" (AI: {item['suggested_priority_reason']})"
+        st.success("Counters Initialized.")
+        if st.button("Reset Simulation and Counters"):
+            st.session_state.sim_initialized = False # Trigger re-init block
+            st.session_state.initial_counters_defined = False
+            # Clear other relevant states
+            st.session_state.customers_served_today = []
+            st.session_state.total_customers_in_system = 0
+            st.session_state.system_log_supermarket = []
+            st.session_state.simulation_time = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+            st.session_state.simulation_running = False
+            st.session_state.last_counter_management_decision = ""
+            st.session_state.gemini_insights = ""
+            st.rerun()
 
-            queue_data.append({
-                "ID": item["id"][:8],
-                "User": item["user_name"],
-                "Issue": item["issue_description"][:50] + "..." if len(item["issue_description"]) > 50 else item["issue_description"],
-                "Priority": priority_display,
-                "Status": item["status"],
-                "Submitted": item["timestamp"].strftime("%Y-%m-%d %H:%M"),
-                "Agent": agent_name if item["assigned_agent_id"] else "Unassigned"
-            })
-        st.dataframe(queue_data, use_container_width=True)
 
-        st.subheader("⚖️ Agentic AI: Task Suggestion")
-        suggested_task = get_suggested_next_task()
-        if suggested_task:
-            st.info(f"**Suggested Next Task (by AI):** ID {suggested_task['id'][:8]} - User: {suggested_task['user_name']}, "
-                    f"Priority: {suggested_task['priority']}, Issue: {suggested_task['issue_description'][:30]}...")
-            
-            if st.session_state.agents:
-                available_agents = [a for a in st.session_state.agents if a["available"]]
-                if available_agents:
-                    agent_to_assign_data = st.selectbox("Assign to Agent:", options=[(a["name"], a["id"]) for a in available_agents], format_func=lambda x: x[0], key="dashboard_assign_agent")
-                    if agent_to_assign_data: # Check if selection is made
-                        agent_to_assign_name, agent_to_assign_id = agent_to_assign_data
-                        if st.button(f"Assign Task {suggested_task['id'][:8]} to {agent_to_assign_name}"):
-                            if assign_task_to_agent(suggested_task["id"], agent_to_assign_id):
-                                st.success(f"Task assigned to {agent_to_assign_name}.")
-                                st.rerun()
-                            else:
-                                st.error("Failed to assign task.")
-                else:
-                    st.warning("No agents available to assign the task.")
-            else:
-                st.warning("No agents configured to assign tasks.")
+    if st.session_state.initial_counters_defined:
+        st.subheader("Simulation Control")
+        if st.session_state.simulation_running:
+            if st.button("⏹️ Pause Simulation", key="pause_sim_sb"):
+                st.session_state.simulation_running = False
+                log_event_supermarket("Simulation Paused.")
+                st.rerun()
         else:
-            st.success("No pending tasks to suggest!")
+            if st.button("▶️ Run Simulation", key="run_sim_sb"):
+                st.session_state.simulation_running = True
+                log_event_supermarket("Simulation Started/Resumed.")
+                st.rerun()
 
-# --- Tab 3: Agent View ---
-with tab3:
-    st.header("🧑‍💻 Agent Workspace")
-    if not st.session_state.agents:
-        st.warning("No agents configured. Please add agents in the sidebar.")
-    else:
-        selected_agent_id = st.selectbox(
-            "Select Agent Profile:",
-            options=[a["id"] for a in st.session_state.agents],
-            format_func=lambda x: next(a["name"] for a in st.session_state.agents if a["id"] == x)
-        )
-        
-        agent = next((a for a in st.session_state.agents if a["id"] == selected_agent_id), None)
+        if not st.session_state.simulation_running:
+             if st.button("⏭️ Simulate Next Step", key="next_step_sb"):
+                simulate_one_step()
+                st.rerun()
 
-        if agent:
-            st.subheader(f"Agent: {agent['name']} (Specialization: {agent['specialization']})")
-            st.metric("Status", "Available" if agent["available"] else "Busy")
-            st.metric("Tasks Resolved", agent["tasks_resolved"])
+        simulation_speed = st.slider("Simulation Speed (steps per second when running)", 0.1, 5.0, 1.0, 0.1, key="sim_speed_sb", disabled=not st.session_state.simulation_running)
 
-            if agent["available"]:
-                st.markdown("---")
-                st.markdown("#### Take Next Task")
-                suggested_task_for_agent = get_suggested_next_task(agent_id=agent["id"])
-                if suggested_task_for_agent:
-                    st.info(f"**AI Suggests:** Task ID {suggested_task_for_agent['id'][:8]} (Priority: {suggested_task_for_agent['priority']}) for User: {suggested_task_for_agent['user_name']}. Issue: {suggested_task_for_agent['issue_description'][:50]}...")
-                    if st.button(f"Take Suggested Task ({suggested_task_for_agent['id'][:8]})", key=f"take_{agent['id']}_{suggested_task_for_agent['id']}"):
-                        if assign_task_to_agent(suggested_task_for_agent["id"], agent["id"]):
-                            st.success("Task taken!")
-                            st.rerun()
-                        else:
-                            st.error("Could not take task (already assigned or agent became busy).")
-                else:
-                    st.success("No pending tasks in the queue.")
+    st.subheader("📜 System Log")
+    log_container_sb = st.container(height=250)
+    for log in reversed(st.session_state.system_log_supermarket):
+        log_container_sb.caption(log)
+
+# Main Application Area
+st.title("🛒 Supermarket Intelligent Queue Automation")
+st.markdown(f"**Simulation Time: {st.session_state.simulation_time.strftime('%A, %B %d, %Y %H:%M')}**")
+
+if not st.session_state.initial_counters_defined:
+    st.info("Please initialize the supermarket layout from the sidebar.")
+else:
+    # Display Counters
+    st.header("🏪 Counter Status")
+    cols = st.columns(len(st.session_state.counters) if st.session_state.counters else 1)
+    for i, counter in enumerate(st.session_state.counters):
+        with cols[i % len(cols)]: # Cycle through columns
+            status_emoji = "✅" if counter["status"] == "Open" else "❌"
+            busy_emoji = "🧑‍💻" if counter["current_customer"] else ("⏳" if counter["queue"] else "🧘")
             
-            else: # Agent is busy
-                current_task_id = agent["current_task_id"]
-                task = next((t for t in st.session_state.queue if t["id"] == current_task_id), None)
-                if task:
-                    st.markdown("---")
-                    st.markdown(f"#### Current Task: ID {task['id'][:8]}")
-                    st.markdown(f"**User:** {task['user_name']}")
-                    st.markdown(f"**Issue:** {task['issue_description']}")
-                    st.markdown(f"**Priority:** {task['priority']}")
-                    st.markdown(f"**Submitted:** {task['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+            card_color = "lightgreen" if counter["status"] == "Open" else "lightcoral"
+            if counter["status"] == "Open" and counter["current_customer"]:
+                card_color = "lightblue"
+            elif counter["status"] == "Open" and counter["queue"]:
+                card_color = "lightyellow"
 
-                    st.markdown("##### 🤖 AI Assistance (Gemini)")
-                    col_gen1, col_gen2 = st.columns(2)
-                    with col_gen1:
-                        if st.button("✍️ Suggest Response", key=f"suggest_resp_{task['id']}"):
-                            if st.session_state.gemini_api_key:
-                                prompt = f"A customer '{task['user_name']}' reported the following issue: '{task['issue_description']}'. What is a polite and helpful initial response I can give them? Keep it concise."
-                                with st.spinner("Gemini AI is thinking..."):
-                                    suggestion = get_gemini_response(prompt) # Switched to Gemini
-                                if suggestion:
-                                    st.text_area("Suggested Response:", value=suggestion, height=150, key=f"resp_val_{task['id']}")
-                            else:
-                                st.warning("Google AI API Key needed for suggestions.")
-                    with col_gen2:
-                        if st.button("📄 Summarize Issue", key=f"summarize_{task['id']}"):
-                            if st.session_state.gemini_api_key:
-                                prompt = f"Summarize this customer issue in one or two sentences: '{task['issue_description']}'"
-                                with st.spinner("Gemini AI is summarizing..."):
-                                    summary = get_gemini_response(prompt, max_tokens=100) # Switched to Gemini
-                                if summary:
-                                    st.info(f"**AI Summary:** {summary}")
-                            else:
-                                st.warning("Google AI API Key needed for summarization.")
-                    
-                    st.markdown("---")
-                    with st.form(f"resolve_task_form_{task['id']}"):
-                        resolution_notes = st.text_area("Resolution Notes:", height=100, key=f"notes_{task['id']}")
-                        submitted_resolve = st.form_submit_button("Mark as Resolved")
-                        if submitted_resolve:
-                            if resolution_notes:
-                                if resolve_task(task["id"], resolution_notes):
-                                    st.success("Task marked as resolved!")
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to resolve task.")
-                            else:
-                                st.warning("Please enter resolution notes.")
-                else:
-                    st.error("Error: Agent is busy but current task not found. This might indicate an inconsistent state.")
-                    if st.button("Force Agent to Available (DEBUG)", key=f"force_avail_{agent['id']}"):
-                        agent['available'] = True
-                        agent['current_task_id'] = None
-                        log_event(f"Agent {agent['name']} forced to available status.")
-                        st.rerun()
 
-# --- For Debugging: Show Raw Session State ---
-# with st.expander("🔍 Show Raw Session State (for debugging)"):
-#     st.json(st.session_state.to_dict())
+            st.markdown(f"""
+            <div style="background-color:{card_color}; padding:10px; border-radius:5px; margin-bottom:10px;">
+                <h4>{counter['type']} {counter['id']} {status_emoji} {busy_emoji}</h4>
+                <b>Status:</b> {counter['status']}<br>
+                <b>Queue Length:</b> {len(counter['queue'])}<br>
+                <b>Serving:</b> {counter['current_customer']['id'][:4] if counter['current_customer'] else 'None'} ({counter['items_remaining_on_customer']:.0f} items left)<br>
+                <b>Est. Wait (next):</b> {calculate_estimated_wait_time(counter):.1f} min
+            </div>
+            """, unsafe_allow_html=True)
+            # Display queue details
+            if counter["queue"]:
+                with st.expander(f"View Queue ({len(counter['queue'])} customers)"):
+                    for cust_idx, cust in enumerate(counter["queue"]):
+                        st.caption(f"{cust_idx+1}. Cust {cust['id'][:4]} ({cust['items']} items)")
+
+
+    # Metrics Display
+    st.header("📊 System Metrics")
+    col_metric1, col_metric2, col_metric3 = st.columns(3)
+    total_served = len(st.session_state.customers_served_today)
+    avg_wait_overall = np.mean([c["wait_time_min"] for c in st.session_state.customers_served_today]) if total_served > 0 else 0
+    
+    col_metric1.metric("Total Customers in System Now", st.session_state.total_customers_in_system)
+    col_metric2.metric("Total Customers Served Today", total_served)
+    col_metric3.metric("Avg. Wait Time (Served)", f"{avg_wait_overall:.1f} min")
+
+    open_counters_now = [c for c in st.session_state.counters if c["status"]=="Open"]
+    utilization_current_step = 0
+    if open_counters_now:
+        busy_time_this_step = sum(c.get("time_busy_current_step", 0) for c in open_counters_now)
+        total_possible_time_this_step = len(open_counters_now) * SIMULATION_STEP_MINUTES
+        utilization_current_step = (busy_time_this_step / total_possible_time_this_step) * 100 if total_possible_time_this_step > 0 else 0
+    
+    st.metric("Overall Counter Utilization (Current Step)", f"{utilization_current_step:.1f}%")
+
+
+    # Generative AI Insights
+    st.header("💡 AI Insights & Suggestions (Gemini)")
+    if 'last_counter_management_decision' in st.session_state and st.session_state.last_counter_management_decision:
+        st.info(f"**Last Agent Decision:** {st.session_state.last_counter_management_decision}")
+
+    if st.button("🤖 Get Gemini Analysis & Suggestions", key="gemini_analysis_sb"):
+        if st.session_state.gemini_api_key_supermarket:
+            # Create a snapshot of the current state for Gemini
+            current_status_prompt = "Current supermarket state:\n"
+            current_status_prompt += f"- Simulation Time: {st.session_state.simulation_time.strftime('%H:%M')}\n"
+            current_status_prompt += f"- Total customers in system: {st.session_state.total_customers_in_system}\n"
+            current_status_prompt += f"- Average wait time for served customers: {avg_wait_overall:.1f} minutes\n"
+            current_status_prompt += "- Counter States:\n"
+            for c in st.session_state.counters:
+                current_status_prompt += f"  - {c['type']} {c['id']}: Status={c['status']}, Queue={len(c['queue'])}, Serving={'Yes' if c['current_customer'] else 'No'}\n"
+            if 'last_counter_management_decision' in st.session_state and st.session_state.last_counter_management_decision:
+                 current_status_prompt += f"- Last automated decision: {st.session_state.last_counter_management_decision}\n"
+
+            prompt_for_gemini = f"{current_status_prompt}\nBased on this, provide a brief (2-3 sentences) summary of the current situation and one actionable suggestion to improve queue flow or customer experience. If an automated decision was just made, briefly explain its rationale if it's not obvious."
+
+            with st.spinner("Gemini is analyzing the situation..."):
+                st.session_state.gemini_insights = get_gemini_supermarket_response(prompt_for_gemini, temperature=0.5)
+            if st.session_state.gemini_insights:
+                st.success("Analysis Complete!")
+            else:
+                st.error("Could not get analysis from Gemini.")
+        else:
+            st.warning("Please enter your Google AI API Key in the sidebar.")
+
+    if 'gemini_insights' in st.session_state and st.session_state.gemini_insights:
+        st.markdown("**Gemini's Analysis:**")
+        st.markdown(f"> {st.session_state.gemini_insights}")
+
+
+# Auto-run simulation if toggled
+if st.session_state.get('simulation_running', False) and st.session_state.initial_counters_defined:
+    simulate_one_step()
+    time.sleep(1.0 / simulation_speed) # Control speed
+    st.rerun()
